@@ -1,0 +1,165 @@
+name: Update AdGuard combined filters
+
+on:
+  schedule:
+    # Every Monday, 09:31 (Vietnam, UTC+7)
+    - cron: '31 2 * * 1'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/combine.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adguard-combine
+  cancel-in-progress: false
+
+jobs:
+  combine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download and combine filter sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          """Build Android/Windows AdGuard content-blocking subscriptions (not DNS)."""
+          
+          from pathlib import Path
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+          
+          ROOT = Path.cwd()
+          FILTER_IDS = (2, 11, 3, 17, 25, 4, 18, 19, 20, 21, 22)
+          ANTI_ADBLOCK_URL = "https://easylist-downloads.adblockplus.org/antiadblockfilters.txt"
+          PLATFORMS = {
+              "Android": "https://filters.adtidy.org/android/filters/{}_optimized.txt",
+              "Windows": "https://filters.adtidy.org/windows/filters/{}.txt",
+          }
+          
+          
+          def download(url: str) -> str:
+              request = Request(
+                  url,
+                  headers={"User-Agent": "AdGuardCombineFilter/1.0", "Accept": "text/plain, */*"},
+              )
+              for attempt in range(3):
+                  try:
+                      with urlopen(request, timeout=45) as response:
+                          data = response.read(50_000_001)
+                      if not data or len(data) > 50_000_000:
+                          raise ValueError("Empty or excessively large filter")
+                      content = data.decode("utf-8-sig")
+                      if re.search(r"^\s*(?:<!doctype\s+html|<html\b)", content[:2048], re.I):
+                          raise ValueError("Server returned HTML, not a filter list")
+                      return content
+                  except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                      if attempt == 2:
+                          raise RuntimeError(f"Failed to download {url}: {exc}") from exc
+                      time.sleep(2 ** attempt)
+              raise AssertionError("Unreachable")
+          
+          
+          def content_rules(text: str, url: str) -> list[str]:
+              """Keep filter rules and meaningful directives; remove source-only metadata."""
+              result = []
+              condition_depth = 0
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line or re.fullmatch(r"\[Adblock Plus(?:\s+[^\]]*)?\]", line, re.I):
+                      continue
+                  if line.startswith("!#"):
+                      command = line.split(maxsplit=1)[0].lower()
+                      if command in ("!#include", "!#import"):
+                          raise ValueError(f"Unresolved preprocessor include in {url}")
+                      if command == "!#if":
+                          condition_depth += 1
+                      elif command == "!#endif":
+                          condition_depth -= 1
+                          if condition_depth < 0:
+                              raise ValueError(f"Unmatched !#endif in {url}")
+                      elif command in ("!#else", "!#elif") and condition_depth == 0:
+                          raise ValueError(f"Unmatched {command} in {url}")
+                      result.append(line)
+                      continue
+                  # !+ hints can be significant; regular ! comments/headers/checksums cannot.
+                  if line.startswith("!") and not line.startswith("!+"):
+                      continue
+                  result.append(line)
+              if condition_depth:
+                  raise ValueError(f"Unclosed !#if in {url}")
+              if not any(not line.startswith("!") for line in result):
+                  raise ValueError(f"No filtering rules found in {url}")
+              return result
+          
+          
+          def write_if_changed(path: Path, content: str) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if path.exists() and path.read_text(encoding="utf-8") == content:
+                  print(f"Unchanged: {path.relative_to(ROOT)}")
+                  return
+              temporary = path.with_suffix(path.suffix + ".tmp")
+              temporary.write_text(content, encoding="utf-8", newline="\n")
+              temporary.replace(path)
+              print(f"Updated: {path.relative_to(ROOT)}")
+          
+          
+          def main() -> None:
+              # Fetch every unique input once. If a source fails, publish no partial output.
+              for platform, url_template in PLATFORMS.items():
+                  sections = {}
+                  for filter_id in FILTER_IDS:
+                      url = url_template.format(filter_id)
+                      print(f"Fetching {url}", flush=True)
+                      sections[filter_id] = content_rules(download(url), url)
+                  if platform == "Android":
+                      android_sections = sections
+                  else:
+                      windows_sections = sections
+              print(f"Fetching {ANTI_ADBLOCK_URL}", flush=True)
+              anti_adblock_rules = content_rules(download(ANTI_ADBLOCK_URL), ANTI_ADBLOCK_URL)
+          
+              for platform, sections in (("Android", android_sections), ("Windows", windows_sections)):
+                  for variant, include_tracking in (("Full", True), ("Without_Tracking_Protection", False)):
+                      lines = [
+                          "[Adblock Plus 2.0]",
+                          f"! Title: AdGuardCombineFilter - {platform} - {variant.replace('_', ' ')}",
+                          "! Expires: 7 days",
+                          "",
+                      ]
+                      for filter_id in FILTER_IDS:
+                          if filter_id == 3 and not include_tracking:
+                              continue
+                          lines.extend(sections[filter_id])
+                          lines.append("")
+                      lines.extend(anti_adblock_rules)
+                      lines.append("")
+                      dest = ROOT / "Filters" / f"AdGuardCombineFilter_{platform}_{variant}.txt"
+                      write_if_changed(dest, "\n".join(lines))
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Commit if filters changed
+        shell: bash
+        run: |
+          git add -- Filters/
+          if git diff --cached --quiet; then
+            echo 'Filters are up to date; no changes to commit.'
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'chore: update combined filters'
+          git push
