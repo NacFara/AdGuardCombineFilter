@@ -41,6 +41,7 @@ jobs:
           ROOT = Path.cwd()
           FILTER_IDS = (2, 11, 3, 17, 25, 4, 18, 19, 20, 21, 22)
           ANTI_ADBLOCK_URL = "https://easylist-downloads.adblockplus.org/antiadblockfilters.txt"
+          ABPVN_URL = "https://raw.githubusercontent.com/abpvn/abpvn/master/filter/abpvn_adguard.txt"
           PLATFORMS = {
               "Android": "https://filters.adtidy.org/android/filters/{}_optimized.txt",
               "Windows": "https://filters.adtidy.org/windows/filters/{}.txt",
@@ -127,6 +128,8 @@ jobs:
                       windows_sections = sections
               print(f"Fetching {ANTI_ADBLOCK_URL}", flush=True)
               anti_adblock_rules = content_rules(download(ANTI_ADBLOCK_URL), ANTI_ADBLOCK_URL)
+              print(f"Fetching {ABPVN_URL}", flush=True)
+              abpvn_rules = content_rules(download(ABPVN_URL), ABPVN_URL)
           
               for platform, sections in (("Android", android_sections), ("Windows", windows_sections)):
                   for variant, include_tracking in (("Full", True), ("Without_Tracking_Protection", False)):
@@ -142,6 +145,8 @@ jobs:
                           lines.extend(sections[filter_id])
                           lines.append("")
                       lines.extend(anti_adblock_rules)
+                      lines.append("")
+                      lines.extend(abpvn_rules)
                       lines.append("")
                       dest = ROOT / "Filters" / f"AdGuardCombineFilter_{platform}_{variant}.txt"
                       write_if_changed(dest, "\n".join(lines))
