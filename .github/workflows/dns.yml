@@ -1,0 +1,219 @@
+name: Update combined DNS filter
+
+on:
+  schedule:
+    # Every Monday at 09:49 Vietnam time (UTC+7).
+    - cron: '49 2 * * 1'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/dns.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adguard-combined-dns
+  cancel-in-progress: false
+
+jobs:
+  combine-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Combine 51 DNS lists
+        shell: bash
+        run: |
+          python - <<'PY'
+          """Combine 51 AdGuard DNS catalog lists into one dedicated DNS subscription."""
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          import filecmp
+          import io
+          import re
+          import time
+          
+          ROOT = Path.cwd()
+          OUTPUT = ROOT / "Filters" / "AdGuardCombineFilter_DNS.txt"
+          # Exactly 51 unique IDs extracted from links in the AdGuard DNS dashboard PDF.
+          SOURCE_IDS = (
+              1, 59, 53, 3, 24, 4, 49, 27, 69, 33,
+              29, 21, 35, 22, 19, 43, 25, 15, 36, 20, 13, 41, 14, 17, 26, 40, 16,
+              30, 12, 55, 71, 52, 44, 8, 18, 10, 42, 31, 9, 50,
+              39, 6, 45, 67, 66, 61, 65, 63, 60, 7, 62,
+          )
+          REFERRAL_ALLOWLIST_ID = 45
+          FORCED_BLOCKS = ("ad.doubleclick.net", "adservice.google.com")
+          MAX_FILE_SIZE = 95_000_000
+          
+          
+          def allow_matches_domain(rule: str, domain: str) -> bool:
+              """Detect allow exceptions conflicting with mandatory blocked domains."""
+              if not rule.startswith("@@"):
+                  return False
+              pattern = rule[2:].split("$", 1)[0]
+              if pattern.startswith("/") and pattern.endswith("/"):
+                  try:
+                      return re.search(pattern[1:-1], domain) is not None
+                  except re.error:
+                      return False
+              anchored = pattern.startswith("||")
+              if anchored:
+                  pattern = pattern[2:]
+              else:
+                  pattern = pattern.lstrip("|")
+              pattern = pattern.rstrip("|")
+              mask = re.escape(pattern).replace(r"\*", ".*").replace(r"\^", r"(?:\.|$)")
+              if anchored:
+                  mask = r"(?:^|\.)" + mask
+              try:
+                  return re.search(mask, domain, flags=re.I) is not None
+              except re.error:
+                  return False
+          
+          
+          def normalize_rules(line: str) -> list[str]:
+              line = line.strip()
+              if not line or line.startswith(("#", "!", "[")):
+                  return []
+              parts = line.split()
+              if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+                  results = []
+                  for host in parts[1:]:
+                      if host.startswith("#"):
+                          break
+                      if host not in ("localhost", "localhost.localdomain"):
+                          results.append(f"||{host.lower()}^")
+                  return results
+              return [line]
+          
+          
+          def prioritize_referral_exception(rule: str) -> str:
+              """DNS $important exceptions outrank even $important blocking rules."""
+              if not rule.startswith("@@"):
+                  return rule
+              if "$" not in rule:
+                  return rule + "$important"
+              mask, modifiers = rule.rsplit("$", 1)
+              if "important" in (m.lower() for m in modifiers.split(",")):
+                  return rule
+              return mask + "$" + modifiers + ",important"
+          
+          
+          def download_rules(source_id: int):
+              url = f"https://filters.adtidy.org/dns/filter_{source_id}.txt"
+              for attempt in range(3):
+                  try:
+                      request = Request(url, headers={
+                          "User-Agent": "AdGuardCombineFilter/1.0",
+                          "Accept": "text/plain, */*",
+                      })
+                      with urlopen(request, timeout=90) as response:
+                          stream = io.TextIOWrapper(response, encoding="utf-8-sig", errors="strict")
+                          for index, line in enumerate(stream):
+                              if index < 15 and re.search(r"<(?:!doctype|html|head|body)\b", line, re.I):
+                                  raise ValueError(f"HTML response instead of DNS rules: {url}")
+                              yield from normalize_rules(line)
+                      return
+                  except (HTTPError, URLError, TimeoutError, UnicodeError, OSError) as exc:
+                      if attempt == 2:
+                          raise RuntimeError(f"Failed source {url}: {exc}") from exc
+                      time.sleep(2 ** attempt)
+          
+          
+          def main() -> None:
+              if len(SOURCE_IDS) != 51 or len(set(SOURCE_IDS)) != 51:
+                  raise RuntimeError("Expected exactly 51 distinct AdGuard DNS filter IDs.")
+              if REFERRAL_ALLOWLIST_ID not in SOURCE_IDS:
+                  raise RuntimeError("Referral allowlist filter #45 must be included.")
+          
+              OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+              staged = OUTPUT.with_suffix(".txt.tmp")
+              seen = set()
+              duplicates = 0
+              try:
+                  with staged.open("w", encoding="utf-8", newline="\n") as out:
+                      out.write("[Adblock Plus 2.0]\n")
+                      out.write("! Title: AdGuardCombineFilter - DNS\n")
+                      out.write("! Expires: 7 days\n")
+                      out.write("! 51 DNS sources; HaGeZi Referral Allowlist has priority.\n\n")
+          
+                      # Process #45 first, but precedence is enforced using $important.
+                      order = (REFERRAL_ALLOWLIST_ID, *(
+                          i for i in SOURCE_IDS if i != REFERRAL_ALLOWLIST_ID
+                      ))
+                      for source_id in order:
+                          count = 0
+                          excluded_exceptions = 0
+                          for rule in download_rules(source_id):
+                              count += 1
+                              if rule.startswith("@@") and any(
+                                  allow_matches_domain(rule, domain) for domain in FORCED_BLOCKS
+                              ):
+                                  excluded_exceptions += 1
+                                  continue
+                              if source_id == REFERRAL_ALLOWLIST_ID:
+                                  rule = prioritize_referral_exception(rule)
+                              if rule in seen:
+                                  duplicates += 1
+                                  continue
+                              seen.add(rule)
+                              out.write(rule + "\n")
+                          if count == 0:
+                              raise RuntimeError(f"Source filter #{source_id} returned no DNS rules.")
+                          print(
+                              f"Filter #{source_id}: {count:,} rules; "
+                              f"{excluded_exceptions} forced-block conflicts removed",
+                              flush=True,
+                          )
+          
+                      # User-specified blocks always win over the referral allowlist.
+                      for domain in FORCED_BLOCKS:
+                          rule = f"||{domain}^$important"
+                          if rule not in seen:
+                              out.write(rule + "\n")
+                              seen.add(rule)
+                      out.flush()
+          
+                  size = staged.stat().st_size
+                  print(
+                      f"DNS merge complete: {len(seen):,} unique rules, "
+                      f"{duplicates:,} exact duplicates removed, {size:,} bytes",
+                      flush=True,
+                  )
+                  if size > MAX_FILE_SIZE:
+                      raise ValueError(
+                          f"Combined DNS file is {size:,} bytes; GitHub raw TXT "
+                          f"requires a file under {MAX_FILE_SIZE:,} bytes."
+                      )
+                  if OUTPUT.exists() and filecmp.cmp(OUTPUT, staged, shallow=False):
+                      print("No DNS changes.")
+                  else:
+                      staged.replace(OUTPUT)
+                      print(f"Updated {OUTPUT.relative_to(ROOT)}")
+              finally:
+                  if staged.exists():
+                      staged.unlink()
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Commit DNS changes
+        shell: bash
+        run: |
+          git add -- Filters/AdGuardCombineFilter_DNS.txt
+          if git diff --cached --quiet; then
+            echo 'DNS filters unchanged.'
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'chore: update combined DNS filter'
+          git pull --rebase origin main
+          git push
